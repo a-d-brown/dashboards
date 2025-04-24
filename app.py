@@ -17,7 +17,10 @@ import os
 import requests
 import json
 from jupyter_dash import JupyterDash
-from dash import Dash, html, dash_table, dcc, Input, Output
+import dash
+import dash_extensions
+from dash import Dash, html, dash_table, dcc, Input, Output, State, callback_context
+from dash_extensions import EventListener
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 from plotly.subplots import make_subplots
@@ -37,11 +40,23 @@ sicbl_legend_mapping = {
     '99C': 'South Tyneside'
 }
 
+alt_code_mapping = {
+    '00L00': 'Northumberland',
+    '00N00': 'South Tyneside',
+    '00P00': 'Sunderland',
+    '01H00': 'North Cumbria',
+    '13T00': 'Newcastle - Gateshead',
+    '16C00': 'North Tyneside',
+    '84H00': 'Durham',
+    '99C00': 'Tees Valley'
+}
+
 # Load data into dataframes
 practice_data = pd.read_csv("pcn_practice_data.csv")
 sicbl_data = pd.read_csv("hrt_by_sicbl.csv")
 ethnicity_data = pd.read_csv("ethnicity.csv")
 mosaic_data = pd.read_csv("mosaic_data.csv")
+saba_data = pd.read_csv("sabas_by_practice_nenc.csv")
 
 # Convert dates into standard datetime format
 sicbl_data['date'] = pd.to_datetime(sicbl_data['date'], format='%d/%m/%Y')
@@ -49,13 +64,15 @@ practice_data['date'] = pd.to_datetime(practice_data['date'], format='%Y%m')
 ethnicity_data['date'] = pd.to_datetime(ethnicity_data['date'], format='%d/%m/%Y')
 
 
-
 # Convert practice names to Title case
 practice_data['practice'] = practice_data['practice'].str.title()
+saba_data['Practice'] = saba_data['Practice'].str.title()
+
+# Strip dummy practices
+saba_data = saba_data[saba_data['PCN'] != 'DUMMY'] 
 
 # Add formatted date column
 practice_data['formatted_date'] = practice_data['date'].dt.strftime('%b %Y')
-
 
 
 # Define latest data as a slice for convenient access later
@@ -63,6 +80,130 @@ jan25_data = practice_data[practice_data['date'] == pd.Timestamp('2025-01-01')]
 
 # Map each SICBL to its display name and add as a new column
 jan25_data.loc[:, 'sicbl_display'] = jan25_data['sicbl'].map(sicbl_legend_mapping)
+
+# Sum items and actual cost wherever practice code and date is the same
+summary = (
+    saba_data
+    .groupby(['Practice Code', 'Year Month'], as_index=False)
+    [['Items', 'Actual Cost']]
+    .sum()
+)
+
+# Prepare base structure for reinsertion of summed data above (dropping duplicate rows to keep one representative row per group i.e. each unique practice / date combo)
+base = (
+    saba_data
+    .drop_duplicates(subset=['Practice Code', 'Year Month'])
+    .drop(columns=['Items', 'Actual Cost', 'BNF Chemical Substance'])
+)
+
+# Merge summed values with the base structure to create full data
+saba_data_merged = pd.merge(base, summary, on=['Practice Code', 'Year Month'])
+
+# Optionally assign a new BNF chemical code to make it clear which drugs the values refer to
+saba_data_merged['BNF Chemical Substance Code'] = '0301011_MERGED'
+
+
+# Step 1: Group and calculate mean values
+means = (
+    saba_data_merged
+    .groupby('Practice Code', as_index=False)
+    [['List Size', 'Actual Cost', 'Items']]
+    .mean()
+    .round(0)
+)
+
+# Step 2: Get one representative row per Practice Code (keeping original non-numeric info)
+base = (
+    saba_data_merged
+    .drop_duplicates(subset='Practice Code')
+    .drop(columns=['List Size', 'Actual Cost', 'Items', 'Year Month'])
+)
+
+# Step 3: Merge means back in
+saba_means_merged = pd.merge(base, means, on='Practice Code')
+
+
+saba_means_merged['Sub-location'] = saba_means_merged['Commissioner / Provider Code'].map(alt_code_mapping)
+
+
+# Calculate Spend per 1000 Patients for each Practice
+saba_means_merged['Spend per 1000 Patients'] = ((saba_means_merged['Actual Cost'] / saba_means_merged['List Size'])*1000).round(1)
+
+# Calculate Average Spend per 1000 Patients across ICB
+total_actual_spend = saba_means_merged['Actual Cost'].sum()
+total_list_size = saba_means_merged['List Size'].sum()
+icb_average_spend = (total_actual_spend / total_list_size) * 1000
+
+
+bar_dynamic = px.bar(
+    saba_means_merged.sort_values('Spend per 1000 Patients', ascending=False),
+    x='Practice',
+    y='Spend per 1000 Patients',
+    hover_name='Practice',
+    #labels={'Actual Cost': 'Spend on SABAs'},
+    hover_data={
+        'Practice Code': False,
+        'Sub-location': False,
+        'Practice': False,
+        'Spend per 1000 Patients': True,
+        'Items': True,
+    },
+    color='Sub-location',
+)
+bar_dynamic.update_layout(
+    height=700,
+    width=1150,
+    xaxis_title='',
+    yaxis_title='',
+    yaxis_tickprefix="£",
+    legend_title_text=None,
+    xaxis=dict(
+        showticklabels=False,
+        showgrid=False,
+        tickangle=45,
+        tickfont=dict(size=10)
+    ),
+    yaxis=dict(
+        showgrid=False
+    ),
+    legend=dict(
+        orientation="h",         # horizontal orientation
+        yanchor="bottom",
+        y=1,                 # moves it below the plot
+        xanchor="center",
+        x=0.5,                   # center the legend
+        itemwidth=50,           # fixed width for each item
+        itemsizing="trace",
+        tracegroupgap=5,        # vertical spacing if wraps
+    )
+)
+
+# Get the number of practices (to understand length of x-axis)
+x_range = len(saba_means_merged['Practice Code'].unique())
+
+# Add ICB average line
+bar_dynamic.add_shape(
+    type="line",
+    x0=0,  # Start at far left of the plotting area
+    x1=1,  # End at far right
+    y0=icb_average_spend,
+    y1=icb_average_spend,
+    line=dict(color="black", width=1.5, dash="dash"),
+    xref="paper",
+    yref="y"
+)
+
+bar_dynamic.add_annotation(
+    x=1,
+    y=icb_average_spend,
+    text="ICB Average",
+    showarrow=False,
+    font=dict(size=12, color="black"),
+    xref="paper",
+    yref="y",
+    xanchor="left",
+)
+
 
 ## CHLOROPLETH
 
@@ -266,27 +407,6 @@ ethnicity_bars.update_layout(
     ),
 )
 
-## WORDCLOUDS
-
-# --- Clinician Barriers (Sample words with more low-count words) ---
-clinician_words = {
-    'Time': 50, 'Workload': 40, 'Training': 30, 'Access': 35, 'Cancer Risk': 25,
-    'Side Effects': 30, 'Awareness': 35, 'Complex Cases': 40, 'NICE': 20, 
-    'Referral': 15, 'Supply': 10, 'Monitoring': 20, 'Misconceptions': 30, 
-    'Health Literacy': 25, 'Complicated History': 10, 'Lack of Resources': 5, 
-    'Policy': 10, 'Prescription Delay': 8, 'Cost': 15
-}
-
-# --- Patient Barriers (Sample words with more low-count words) ---
-patient_words = {
-    'Dismissed': 40, 'Waiting': 50, 'Ignored': 35, 'Embarrassment': 45, 'Confusion': 40,
-    'Scared': 30, 'Stigma': 35, 'Alone': 25, 'Ashamed': 30, 'Anxious': 20, 'Taboo': 20, 
-    'Uninformed': 30, 'Side Effects': 30, 'No Time': 25, 'Unheard': 30, 'Too Late': 15,
-    'Frustrated': 25, 'Confidentiality': 10, 'Judgment': 8, 'Misunderstanding': 12,
-    'Treatment Options': 10, 'Lack of Trust': 10, 'Bitcoin': 1  # Added Bitcoin with count of 1
-}
-
-
 ## INITIALISE PYTHON DASH APP
 external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 app = Dash(__name__, external_stylesheets=external_stylesheets)
@@ -312,16 +432,11 @@ app.layout = html.Div(
                 'padding': '10px',  # Add some padding around the title for better alignment
             }
         ),
-        
-        html.H3('Percentage of women aged 40-54y in the North East prescribed HRT across PCNs in Jan25', style={'marginTop': '40px'}),
-        html.Img(
-            src='/assets/pcn_bar_chart.png',
-            style={
-                'width': '75%',  # adjust to your liking
-                'marginTop': '10px',
-                'borderRadius': '10px'
-            }
-        ),
+
+        html.H3('Percentage of women aged 40-54 years in the North East taking HRT by ethnic group in Jan25', style={'marginTop': '40px'}),
+        dcc.Graph(id='bar_dynamic_graph', figure=bar_dynamic),
+
+
         
         html.H3("HRT prescribing in women aged 40-54y: GP Practice Trends"),
         html.Div(
@@ -361,7 +476,7 @@ app.layout = html.Div(
         dcc.Graph(
             id='newlinegraph',
             style={'height': '600px'}
-            ),    
+            ),
         
         html.H3('HRT prescribing in women aged 40-54y in the North East by ethnic group ', style={'marginTop': '40px'}),
         dcc.Graph(figure=linegraph),
@@ -379,7 +494,7 @@ app.layout = html.Div(
         html.Img(
             src='/assets/wordcloud.png',
             style={
-                'width': '75%',  # adjust to your liking
+                'width': '75%',
                 'marginTop': '10px',
                 'borderRadius': '10px',
                 'boxShadow': '0px 0px 10px rgba(0,0,0,0.1)'
@@ -389,6 +504,27 @@ app.layout = html.Div(
 )
 
 # Callbacks
+@app.callback(
+    Output("bar_dynamic_graph", "figure"),
+    Input("bar_dynamic_graph", "restyleData"),
+    State("bar_dynamic_graph", "figure"),
+)
+def update_bar_dynamic_graph_on_legend_toggle(restyle_data, fig):
+    if not restyle_data:
+        return fig
+
+    # Here you can inspect visibility
+    visibilities = []
+    for i, trace in enumerate(fig["data"]):
+        vis = trace.get("visible", True)
+        if vis not in [False, "legendonly"]:
+            visibilities.append(True)
+
+    show_xticks = len(visibilities) == 1
+
+    fig["layout"]["xaxis"]["showticklabels"] = show_xticks
+    return fig
+
 @app.callback(
     Output('practice-dropdown', 'options'),
     Output('practice-dropdown', 'value'),
@@ -460,7 +596,9 @@ def update_graph(sicbl, selected_practice):
             selected_practice + '<br>' +
             'HRT Items per 1000 Patients: %{y:.1f}<br>' +
             'Time Period: %{customdata}<extra></extra>'
-        )
+        ),
+        showlegend=False
+
     ))
     
     # Add national average trace (ensure it appears in legend)
@@ -476,13 +614,43 @@ def update_graph(sicbl, selected_practice):
             'Time Period: %{customdata}<extra></extra>'
         ),
         line=dict(color='#2A6FBA', width=2),
-        showlegend=True  # Make sure this is True to display in legend
+        showlegend=False
     ))
+
+    # Add label at the end of selected practice line
+    last_date = selected_data['date'].max()
+    last_value = selected_data[selected_data['date'] == last_date]['hrt_items_per_patient'].values[0]
+
+    fig.add_annotation(
+        x=last_date,
+        y=last_value,
+        text=selected_practice,
+        showarrow=False,
+        xanchor='left',
+        yanchor='middle',
+        font=dict(color='firebrick'),
+        xshift=5
+    )
 
     fig.update_layout(
         title=f"HRT Items per 1000 Patients for {selected_practice} and PCN Peers",
         yaxis_title='HRT Items per 1000 Patients',
         template='simple_white'
+    )
+
+    # Add label at the end of national average line
+    last_nat_date = national_data['date'].max()
+    last_nat_value = national_data[national_data['date'] == last_nat_date]['hrt_items_per_patient'].values[0]
+
+    fig.add_annotation(
+        x=last_nat_date,
+        y=last_nat_value,
+        text='National Average',
+        showarrow=False,
+        xanchor='left',
+        yanchor='middle',
+        font=dict(color='#2A6FBA'),
+        xshift=5
     )
     
     # Move legend to the bottom center
