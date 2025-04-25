@@ -40,17 +40,6 @@ sicbl_legend_mapping = {
     '99C': 'South Tyneside'
 }
 
-alt_code_mapping = {
-    '00L00': 'Northumberland',
-    '00N00': 'South Tyneside',
-    '00P00': 'Sunderland',
-    '01H00': 'North Cumbria',
-    '13T00': 'Newcastle - Gateshead',
-    '16C00': 'North Tyneside',
-    '84H00': 'Durham',
-    '99C00': 'Tees Valley'
-}
-
 # Load data into dataframes
 practice_data = pd.read_csv("pcn_practice_data.csv")
 sicbl_data = pd.read_csv("hrt_by_sicbl.csv")
@@ -70,6 +59,11 @@ saba_data['Practice'] = saba_data['Practice'].str.title()
 
 # Strip dummy practices
 saba_data = saba_data[saba_data['PCN'] != 'DUMMY'] 
+
+
+# Remove the last 2 characters from the SICBL code
+saba_data['Commissioner / Provider Code'] = saba_data['Commissioner / Provider Code'].str.slice(0, -2)
+
 
 # Add formatted date column
 practice_data['formatted_date'] = practice_data['date'].dt.strftime('%b %Y')
@@ -123,7 +117,7 @@ base = (
 saba_means_merged = pd.merge(base, means, on='Practice Code')
 
 
-saba_means_merged['Sub-location'] = saba_means_merged['Commissioner / Provider Code'].map(alt_code_mapping)
+saba_means_merged['Sub-location'] = saba_means_merged['Commissioner / Provider Code'].map(sicbl_legend_mapping)
 
 
 # Calculate Spend per 1000 Patients for each Practice
